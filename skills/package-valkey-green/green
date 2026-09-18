@@ -25,7 +25,7 @@
 
 ;; Managed by `bb pin` — do not edit by hand. An initial nil is intentional:
 ;; the repository must be committed and pushed before a real SHA can be stamped.
-(def ^:private valkey-sha nil)
+(def ^:private valkey-sha "1382f8ccea99bcf21696e5a3c7ba6b0146a77bc7")
 
 (def ^:private valkey-git-url "https://github.com/getcolors/valkey.git")
 (def ^:private green-git-url "https://github.com/getcolors/green.git")
