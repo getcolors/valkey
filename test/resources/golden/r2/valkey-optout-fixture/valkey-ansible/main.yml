@@ -1,0 +1,221 @@
+---
+# Convergence for the Valkey host.
+#
+# One machine, one Compose service, and gates that ask the system what it has
+# rather than trusting exit codes: the round-trip, the configuration Valkey
+# actually runs with, the auth negatives, the bind addresses, persistence
+# across a restart, and a first backup set with a completion marker. The
+# password is create-once (`creates:`): regenerating it would lock every
+# client out of a service that still works. Quoting-heavy shell lives in the
+# installed scripts, not in this file — Ansible splits a shell block before
+# running it, counting quotes across comments, and a lone apostrophe in a
+# comment fails the play at load time.
+- name: Install Valkey
+  hosts: valkey
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - ansible.builtin.wait_for_connection: {connect_timeout: 10, delay: 5, sleep: 5, timeout: 600}
+    - ansible.builtin.setup:
+  handlers:
+    - name: Bring up valkey
+      ansible.builtin.command: docker compose up -d
+      args: {chdir: /opt/valkey}
+    - name: Reload systemd
+      ansible.builtin.systemd_service: {daemon_reload: true}
+    - name: Restart sshd
+      ansible.builtin.service: {name: ssh, state: restarted}
+  tasks:
+    - name: Install Docker and the tools the scripts rely on
+      ansible.builtin.apt:
+        name: [docker.io, docker-compose-v2, ca-certificates, curl, jq, openssl,
+               python3, rclone]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+    - ansible.builtin.systemd_service: {name: docker, enabled: true, state: started}
+    - ansible.builtin.file: {path: "{{ item.path }}", state: directory, mode: "{{ item.mode }}"}
+      loop:
+        - {path: /opt/valkey, mode: "0755"}
+        - {path: /etc/valkey, mode: "0755"}
+        - {path: /etc/valkey/secrets, mode: "0700"}
+        - {path: /opt/colors, mode: "0755"}
+        - {path: /etc/colors, mode: "0755"}
+        - {path: /var/lib/colors, mode: "0755"}
+
+    # The provider firewall restricts SSH to the configured source CIDR.
+    # Keep password login disabled too. Ubuntu ships 50-cloud-init.conf with
+    # `PasswordAuthentication yes`; this 10- file wins because sshd uses the
+    # FIRST value obtained for a keyword.
+    - name: Harden sshd
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-colors-valkey.conf
+        mode: "0644"
+        content: |
+          PasswordAuthentication no
+          PermitRootLogin prohibit-password
+          KbdInteractiveAuthentication no
+      notify: Restart sshd
+
+    # The one operator secret on this host: the R2 pair the backup sets are
+    # written with. It arrives as Ansible env lookups resolved at execution
+    # time, so the rendered playbook in .colors/ carries the expression and
+    # never the value.
+    - name: Install the backup credential
+      ansible.builtin.copy:
+        dest: /etc/colors/backup-r2.env
+        mode: "0600"
+        content: |
+          BACKUP_R2_ACCESS_KEY_ID={{ lookup('env','COLORS_PAR_VALKEY_BACKUP_R2_ACCESS_KEY_ID') }}
+          BACKUP_R2_SECRET_ACCESS_KEY={{ lookup('env','COLORS_PAR_VALKEY_BACKUP_R2_SECRET_ACCESS_KEY') }}
+      no_log: true
+
+    - name: Refuse an empty backup credential
+      ansible.builtin.shell: |
+        set -euo pipefail
+        grep -q '^BACKUP_R2_ACCESS_KEY_ID=..*' /etc/colors/backup-r2.env || { echo "empty backup key id" >&2; exit 1; }
+        grep -q '^BACKUP_R2_SECRET_ACCESS_KEY=..*' /etc/colors/backup-r2.env || { echo "empty backup secret" >&2; exit 1; }
+      args: {executable: /bin/bash}
+      changed_when: false
+
+    # The password is born on this host and never leaves it: read it over SSH.
+    - name: Generate the Valkey password once, on this host only
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 077
+        openssl rand -hex 24 > /etc/valkey/secrets/password
+      args: {creates: /etc/valkey/secrets/password, executable: /bin/bash}
+
+    # The configuration carries the password so that neither the command
+    # line nor the container environment does. Readable by the container
+    # valkey user (uid 999) and nobody else. `bind 0.0.0.0` is the address
+    # INSIDE the container; what reaches it is decided by the loopback host
+    # bindings in the Compose file. noeviction: a full memory is an error to
+    # the writer, never a silently dropped key.
+    - name: Render the Valkey configuration
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 077
+        pw=$(cat /etc/valkey/secrets/password)
+        [ -n "$pw" ] || { echo "empty valkey password" >&2; exit 1; }
+        {
+          printf 'requirepass %s\n' "$pw"
+          printf 'maxmemory-policy noeviction\n'
+          printf 'appendonly yes\n'
+          printf 'appendfsync everysec\n'
+          printf 'bind 0.0.0.0\n'
+          printf 'protected-mode yes\n'
+        } > /opt/valkey/valkey.conf.next
+        chown 999:999 /opt/valkey/valkey.conf.next
+        chmod 0400 /opt/valkey/valkey.conf.next
+        if cmp -s /opt/valkey/valkey.conf.next /opt/valkey/valkey.conf 2>/dev/null; then
+          rm -f /opt/valkey/valkey.conf.next; echo unchanged
+        else
+          mv /opt/valkey/valkey.conf.next /opt/valkey/valkey.conf; echo updated
+        fi
+      args: {executable: /bin/bash}
+      register: valkey_conf
+      changed_when: "'updated' in valkey_conf.stdout"
+      notify: Bring up valkey
+
+    - name: Install the Compose file
+      ansible.builtin.copy: {src: compose.yml, dest: /opt/valkey/compose.yml, mode: "0644"}
+      notify: Bring up valkey
+
+    - name: Install the operational scripts
+      ansible.builtin.copy: {src: "{{ item.src }}", dest: "{{ item.dest }}", mode: "0755"}
+      loop:
+        - {src: r2-env.sh, dest: /opt/colors/r2-env.sh}
+        - {src: valkey-backup.sh, dest: /usr/local/sbin/valkey-backup}
+        - {src: valkey-restore-check.sh, dest: /usr/local/sbin/valkey-restore-check}
+        - {src: valkey-smoke.sh, dest: /usr/local/sbin/valkey-smoke}
+        - {src: valkey-monitor.sh, dest: /usr/local/sbin/valkey-monitor}
+        - {src: valkey-status.sh, dest: /usr/local/sbin/valkey-status}
+
+    - ansible.builtin.meta: flush_handlers
+
+    - name: Enforce the running state
+      ansible.builtin.command: docker compose up -d
+      args: {chdir: /opt/valkey}
+      register: valkey_up
+      changed_when: "'Started' in valkey_up.stderr or 'Recreated' in valkey_up.stderr or 'Created' in valkey_up.stderr"
+
+    - name: Wait for Valkey
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd /opt/valkey
+        VALKEYCLI_AUTH=$(cat /etc/valkey/secrets/password)
+        export VALKEYCLI_AUTH
+        reply=$(docker compose exec -T -e VALKEYCLI_AUTH valkey valkey-cli --no-auth-warning PING | tr -d '\r')
+        [ "$reply" = PONG ]
+      args: {executable: /bin/bash}
+      register: valkey_ping
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: valkey_ping.rc == 0
+
+    # The server-side gates: the round-trip, the configuration, the auth
+    # negatives, the bind addresses, and persistence across a restart.
+    - name: Prove the deployment works end to end
+      ansible.builtin.command: /usr/local/sbin/valkey-smoke {{ ansible_host }}
+      register: smoke
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: smoke.rc == 0
+
+    - name: Install the timers
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}"
+        mode: "0644"
+        content: "{{ item.content }}"
+      loop:
+        - name: valkey-backup.service
+          content: |
+            [Unit]
+            Description=Valkey backup set
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/valkey-backup
+        - name: valkey-backup.timer
+          content: |
+            [Unit]
+            Description=Valkey backup set
+            [Timer]
+            OnCalendar=*-*-* 00/6:00:00
+            Persistent=true
+            [Install]
+            WantedBy=timers.target
+        - name: valkey-monitor.service
+          content: |
+            [Unit]
+            Description=Valkey health check
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/valkey-monitor
+        - name: valkey-monitor.timer
+          content: |
+            [Unit]
+            Description=Valkey health check
+            [Timer]
+            OnCalendar=*:0/15
+            Persistent=true
+            [Install]
+            WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Enable the timers
+      ansible.builtin.systemd_service: {name: "{{ item }}", enabled: true, state: started, daemon_reload: true}
+      loop: [valkey-backup.timer, valkey-monitor.timer]
+
+    # A first set now, so the monitor has something to measure and the
+    # rehearsal has something to restore.
+    - name: Take the first backup set
+      ansible.builtin.command: /usr/local/sbin/valkey-backup
+      register: first_set
+      changed_when: "'complete' in first_set.stdout"
+
+    - name: Require a healthy monitor result
+      ansible.builtin.command: /usr/local/sbin/valkey-monitor
+      changed_when: false

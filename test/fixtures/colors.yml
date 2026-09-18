@@ -1,0 +1,23 @@
+# Keygen-mode fixture: no vultr-ssh-keys, so the package owns the keypair.
+profile: valkey-fixture
+workdir: WORKDIR
+provider-compute: vultr
+provider-backend: r2
+compute-prevent-destroy: true
+valkey-image: docker.io/valkey/valkey:9.1.2@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d
+valkey-version: 9.1.2
+valkey-port: 6379
+valkey-backup-r2-bucket: valkey-backup-fixture
+valkey-backup-r2-endpoint: https://fixture.r2.cloudflarestorage.com
+valkey-backup-r2-region: auto
+valkey-backup-oncalendar: "*-*-* 00/6:00:00"
+valkey-backup-retention-days: 7
+valkey-backup-max-age-hours: 8
+vultr-region: ams
+vultr-plan: vc2-1c-2gb
+vultr-os-id: 2284
+vultr-ssh-sources:
+  - 0.0.0.0/0
+  - "::/0"
+r2-bucket: tofu-state-fixture
+r2-endpoint: https://fixture.r2.cloudflarestorage.com

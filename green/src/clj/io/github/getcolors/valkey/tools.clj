@@ -1,0 +1,387 @@
+(ns io.github.getcolors.valkey.tools
+  (:require [babashka.process :as bp]
+            [cheshire.core :as json]
+            [clojure.string :as str]
+            [clojure.java.io :as io]
+            [green.ansible :as ansible]
+            [green.cli :as green-cli]
+            [green.process :as process]
+            [green.scaffold :as sc]
+                        [green.workflow :as wf]
+            [io.github.getcolors.valkey.compute :as compute]
+            [io.github.getcolors.compute :as library]
+            [io.github.getcolors.compute-orchestration :as orchestration]
+            [io.github.getcolors.compute-inspection :as inspection]
+            [io.github.getcolors.compute-planning :as planning]
+            [io.github.getcolors.valkey.ssh-config :as ssh-config]
+            [io.github.getcolors.valkey.validate :as validate]))
+
+(def infrastructure-tool "valkey-infrastructure")
+(def ansible-tool "valkey-ansible")
+(def ansible-local-tool "valkey-ansible-local")
+(def root "io.github.getcolors.valkey.tools")
+(def template-opts sc/preserve-jinja-delimiters)
+
+(defn tool-dir [opts tool] (green-cli/stage-dir opts tool {:default-profile "valkey"}))
+(defn template [path file] (keyword (str root "." path) file))
+(defn spec [source target data] {:template source :target target :data data :opts template-opts})
+(defn raw-spec [target content] (sc/content-spec target content))
+
+(def placeholder-ip "192.0.2.10")
+
+(defn set-prefix [opts] (str (:profile opts) "/valkey"))
+
+(defn environment [_] (into {} (System/getenv)))
+
+;; ---------------------------------------------------------------- compute
+
+(defn- compute-json [value indent]
+  (let [padding #(apply str (repeat % " "))]
+    (cond
+      (map? value) (if (empty? value) "{}"
+                      (str "{\n" (str/join ",\n" (for [[key item] (sort-by (comp name key) value)]
+                                                       (str (padding (+ indent 2)) (json/generate-string key) ": " (compute-json item (+ indent 2)))))
+                           "\n" (padding indent) "}"))
+      (sequential? value) (if (empty? value) "[]"
+                              (str "[\n" (str/join ",\n" (map #(str (padding (+ indent 2)) (compute-json % (+ indent 2))) value)) "\n" (padding indent) "]"))
+      :else (json/generate-string value))))
+
+(defn infrastructure-step [opts]
+  (try
+    (let [planning? (or (= :build (:green/event opts)) (:green/dry-run opts))
+          result (if planning?
+                   (planning/plan-deployment opts (compute/topology opts) (compute/requirements opts))
+                   (orchestration/orchestrate opts (compute/topology opts) (compute/requirements opts) (environment opts)))]
+      (when planning?
+        (doseq [[stage key] (cons ["shared" (get-in result [:state_keys :shared])]
+                                 (map (fn [[id key]] [(str "nodes/" (name id)) key]) (get-in result [:state_keys :nodes]))) ]
+          (let [target (io/file (tool-dir opts infrastructure-tool) stage "backend.tf.json")]
+            (io/make-parents target)
+            (spit target (str (compute-json (:config (library/backend-plan opts key)) 0) "\n"))))
+        (doseq [[stage documents] (cons ["shared" (get-in result [:documents :shared])]
+                                      (map (fn [[id documents]] [(str "nodes/" id) documents]) (get-in result [:documents :nodes])))
+                [filename document] documents]
+          (let [target (io/file (tool-dir opts infrastructure-tool) stage filename)]
+            (io/make-parents target)
+            (spit target (str (compute-json document 0) "\n")))))
+      (if-not (contains? #{"ready" "planned" "destroyed"} (:status result))
+        (assoc opts :green/exit 1 :green/err (if (seq (:errors result)) (str/join "\n" (:errors result)) "compute lifecycle refused; inspect state ownership and configuration"))
+        (cond-> (assoc opts :green/exit 0)
+          (:shared result) (assoc :colors-compute/shared (:shared result))
+          (:cluster result) (assoc :colors-compute/cluster (:cluster result) :ip (get-in result [:cluster :nodes 0 :ip]) :user (get-in result [:cluster :nodes 0 :user]))
+          (get-in result [:key :private_key_path])
+          (assoc :ssh-private-key-path (if planning? (str/replace (get-in result [:key :private_key_path]) "$HOME/.ssh" "/home/build-placeholder/.ssh") (get-in result [:key :private_key_path]))))))
+    (catch Exception _ (assoc opts :green/exit 1 :green/err "compute lifecycle refused; legacy monolithic state requires explicit migration"))))
+
+(defn managed-backend? [opts] (= "managed" (:s3-bucket-mode opts)))
+
+(defn load-infrastructure-step
+  "Inspect the recorded deployment before any verb that needs the host.
+
+  A delete has two routes past a missing machine, so a repeat delete exits 0
+  instead of demanding state that is gone. Compute destroyed or absent:
+  `:valkey/already-destroyed` skips the host and the compute destroy, and the
+  workflow continues with the managed backend finalizer when configured. Inspection error under a managed
+  backend: the bucket itself may already be finalized, which reads as an
+  unreadable state, so `:valkey/finalize-only` routes straight to the
+  finalizer, which proves absence or owned retirement before it succeeds.
+  Everywhere else an unreadable state stays an error: a failed read never
+  means absence."
+  [opts]
+  (try
+    (let [delete? (= :delete (:green/event opts))
+          result (inspection/read-deployment opts (environment opts) {} (compute/requirements opts))]
+      (case (:status result)
+        "present" (let [node (first (get-in result [:cluster :nodes]))
+                        ready (cond-> (assoc opts :colors-compute/cluster (:cluster result)
+                                                  :colors-compute/shared (:shared result)
+                                                  :ip (:ip node) :user (:user node) :green/exit 0)
+                                (:ssh_identity_file node) (assoc :ssh-private-key-path (:ssh_identity_file node)))]
+                    ready)
+        "destroyed" (if delete? (assoc opts :valkey/already-destroyed true :green/exit 0)
+                        (assoc opts :green/exit 1 :green/err "compute deployment is destroyed"))
+        "absent" (if (and delete? (managed-backend? opts))
+                   (assoc opts :valkey/already-destroyed true :green/exit 0)
+                   (assoc opts :green/exit 1 :green/err "compute inspection refused; existing owned state is required"))
+        (if (and delete? (managed-backend? opts))
+          (assoc opts :valkey/finalize-only true :green/exit 0)
+          (assoc opts :green/exit 1 :green/err "compute inspection refused; existing owned state is required"))))
+    (catch Exception e (assoc opts :green/exit 1 :green/err (or (not-empty (ex-message e)) "compute inspection refused; existing owned state is required")))))
+
+;; ---------------------------------------------------------- ansible (local)
+
+(defn ansible-local-data
+  "Only what a `build` genuinely knows. The address, the user and the alias are
+  run-time facts and reach the play as extra-vars instead, so the rendered
+  playbook carries no IP and is identical on every workstation (SSH Config
+  Standard §6)."
+  [opts]
+  (assoc (apply dissoc opts validate/application-secrets)
+         :ssh-keygen (validate/keygen? opts)
+         :ssh-config-identity-file (ssh-config/identity-file opts)))
+
+(defn ansible-local-specs [opts]
+  (let [dir (tool-dir opts ansible-local-tool) data (ansible-local-data opts)]
+    [(spec (template "ansible-local" "ansible.cfg") (str dir "/ansible.cfg") data)
+     (spec (template "ansible-local" "inventory.ini") (str dir "/inventory.ini") data)
+     (spec (template "ansible-local" "main.yml") (str dir "/main.yml") data)]))
+
+(defn ansible-local-step
+  "Write or remove the `~/.ssh/config` block. The same playbook serves both
+  events; `block_state` is what distinguishes them."
+  [opts]
+  (let [dir (tool-dir opts ansible-local-tool)
+        delete? (= :delete (:green/event opts))]
+    (ansible/ansible-with-spec opts
+      {:dir dir :inventory "inventory.ini"
+       :playbooks {:create "main.yml" :delete "main.yml"}
+       :extra-vars {:host_alias (ssh-config/host-alias opts)
+                    :ssh_hosts [(select-keys (assoc (compute/node opts) :name (ssh-config/host-alias opts)) [:name :ip :user])]
+                    :block_state (if delete? "absent" "present")}}
+      (ansible-local-specs opts))))
+
+;; ---------------------------------------------------------------- ansible
+
+(defn inventory [opts]
+  (let [node (compute/node opts) identity (or (:ssh-private-key-path opts) (:ssh_identity_file node))]
+    (json/generate-string
+     {:all {:children {:valkey {:hosts {(:profile opts)
+       (cond-> {:ansible_host (:ip node) :ansible_user (:user node)}
+         identity (assoc :ansible_ssh_private_key_file identity))}}}}} {:pretty true})))
+
+(defn ansible-data
+  "Template values for the Ansible stage.
+
+  Deliberately carries no operator secret. The backup pair reaches the host as
+  Ansible `lookup('env', ...)` expressions written literally into main.yml,
+  where `preserve-jinja-delimiters` passes them through untouched — routing
+  them through this map instead would let Selmer HTML-escape the quotes and
+  hand Ansible `&#39;`. The secret therefore exists only in the process that
+  needs it: not in `.colors/`, not in a golden, not in this map."
+  [opts]
+  (assoc (apply dissoc opts validate/application-secrets)
+         :ip (:ip (compute/node opts))
+         :ssh-keygen (validate/keygen? opts)
+         :valkey-backup-set-prefix (set-prefix opts)))
+
+(def ansible-files
+  ["ansible.cfg" "main.yml" "cleanup.yml" "rehearsal.yml" "compose.yml"
+   "r2-env.sh" "valkey-backup.sh" "valkey-restore-check.sh"
+   "valkey-smoke.sh" "valkey-monitor.sh" "valkey-status.sh"])
+
+(defn ansible-specs [opts]
+  (let [dir (tool-dir opts ansible-tool) data (ansible-data opts)]
+    (conj (mapv (fn [f] (spec (template "ansible" f) (str dir "/" f) data)) ansible-files)
+          (raw-spec (str dir "/inventory.json") (inventory data)))))
+
+(def play-timeout-ms 7200000)
+
+(defn play-env [_ _] {"ANSIBLE_HOST_KEY_CHECKING" "False"})
+
+(defn run-play
+  "Scaffold the Ansible tree and run `playbook` in it. Mirrors
+  `green.ansible/ansible-with-spec`, which cannot take an environment: build
+  renders and stops; delete renders, runs, then removes the rendered tree;
+  every other event renders and runs. The PLAY RECAP lands under
+  :ansible/recap and a failure carries the play's output, as the SDK step's
+  does."
+  [opts playbook credentials?]
+  (let [specs (ansible-specs opts) event (:green/event opts)]
+    (if (= :build event)
+      (sc/scaffold opts specs)
+      (let [rendered (-> opts (assoc :green/event :create) (sc/scaffold specs) (assoc :green/event event))
+            result (process/run-with-timeout ["ansible-playbook" "-i" "inventory.json" playbook]
+                                             {:dir (tool-dir opts ansible-tool) :extra-env (play-env opts credentials?)}
+                                             play-timeout-ms)
+            ;; A runtime timeout reports a negative exit; anything but 0 is a failure.
+            exit (let [e (:exit result)] (cond (not (integer? e)) 1 (zero? e) 0 (pos? e) e :else 1))]
+        (cond
+          (pos? exit) (assoc rendered :green/exit exit
+                             :green/err (str "ansible-playbook " playbook " failed: "
+                                             (or (not-empty (:out result)) (not-empty (:err result)) "(no output)")))
+          (= :delete event) (sc/scaffold (assoc rendered :green/exit 0 :ansible/recap (ansible/parse-recap (:out result))) specs)
+          :else (assoc rendered :green/exit 0 :ansible/recap (ansible/parse-recap (:out result))))))))
+
+(defn ansible-step
+  "Converge the host or stop its services before compute destruction."
+  [opts]
+  (let [delete? (= :delete (:green/event opts))]
+    (if (and delete? (not (:ip opts)))
+      ;; No compute in state: there is no host to stop, and the cleanup play
+      ;; would only fail against the placeholder address.
+      (assoc opts :green/exit 0)
+      (run-play opts (if delete? "cleanup.yml" "main.yml") (not delete?)))))
+
+(defn rehearsal-step
+  "The recovery rehearsal: a fresh backup set, its restore into a scratch
+  instance of the pinned image, the smoke key read back from the restored
+  data, and only then the recovery marker. Runs the same rendered tree as the
+  converge, with the operator-supplied backup credential pair."
+  [opts]
+  (run-play opts "rehearsal.yml" true))
+
+;; ------------------------------------------------------------- acceptance
+
+(defn run-quiet
+  "Capture probe output. CLI probes receive only PATH and their explicit auth
+  environment; no password is expanded into an argv assignment."
+  [args env timeout-ms]
+  (if (= "valkey-cli" (first args))
+    (try
+      (let [child (bp/process args {:env (merge {"PATH" (System/getenv "PATH")} env)
+                                   :out :string :err :string})
+            result (deref child timeout-ms ::timeout)]
+        (if (= ::timeout result)
+          (do (bp/destroy-tree child) {:exit -1 :out "" :err "CLI probe timed out"})
+          (select-keys result [:exit :out :err])))
+      (catch Exception _ {:exit -1 :out "" :err "CLI probe could not start"}))
+    (process/run-with-timeout args (if (seq env) {:extra-env env} {}) timeout-ms)))
+
+(defn valkey-args
+  "Explicit CLI arguments. Authentication reaches only the child environment."
+  [port _auth? & cmd]
+  (into ["valkey-cli" "--no-auth-warning" "-h" "127.0.0.1" "-p" (str port)] cmd))
+
+(defn tunnel-args
+  "An ssh tunnel through the generated `~/.ssh/config` alias — the supported
+  client path, exercised end to end: the alias, the identity file, and the
+  forward. `-f` returns once the forward is up; the remote `sleep` bounds its
+  lifetime so nothing needs killing on the way out. The bash wrapper exists
+  for the streams: the daemonized child inherits stdout/stderr, and a runner
+  that waits for the pipes to close would otherwise block until the sleep
+  expires — returning exactly when the tunnel dies."
+  [opts port]
+  ["bash" "-c"
+   (str "ssh -f -o ExitOnForwardFailure=yes -o BatchMode=yes"
+        " -L " port ":127.0.0.1:" (:valkey-port opts) " "
+        (ssh-config/host-alias opts) " sleep 45 >/dev/null 2>&1")])
+
+(defn closed-port-args
+  "Exit 0 means reachable, 10 means refused or timed out, and 20 means the
+  probe could not establish a result. Operational errors never prove closure."
+  [ip port]
+  ["python3" "-c"
+   (str "import socket,sys\n"
+        "try:\n s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=5)\n"
+        "except (ConnectionRefusedError,TimeoutError): sys.exit(10)\n"
+        "except OSError: sys.exit(20)\n"
+        "else:\n s.close()\n sys.exit(0)\n")
+   (str ip) (str port)])
+
+(def password-file "/etc/valkey/secrets/password")
+
+(def remote-password-command
+  "Read the root-only password file as whoever the alias logs in as: root on
+  the Vultr and DigitalOcean images, `ubuntu` on the AWS AMI, where the
+  fallback to passwordless sudo is what makes the file readable. One remote
+  command string; ssh hands it to the login shell."
+  (str "cat " password-file " 2>/dev/null || sudo -n cat " password-file))
+
+(defn read-remote-password
+  "The generated Valkey password, read over SSH and held only in this process.
+  Never merged into opts, never printed."
+  [opts]
+  (let [r (run-quiet ["ssh" "-o" "BatchMode=yes" (ssh-config/host-alias opts) remote-password-command]
+                     {} 20000)]
+    (when (zero? (:exit r)) (str/trim (str (:out r))))))
+
+(defn reply [r] (str/trim (str (:out r) (:err r))))
+
+(defn acceptance-step
+  "The operator-path gate, after a real create.
+
+  The server-side gates already ran inside the playbook (the round-trip, the
+  configuration, the auth negatives, the bind addresses, persistence across
+  a restart, the first backup set). What is checked from here is what only
+  this side can check: that an operator on this workstation reaches Valkey
+  through the generated SSH config and a tunnel with the generated password
+  and not without it — and that the public address does not answer on the
+  Valkey port at all."
+  [opts]
+  (if (not= :create (:green/event opts))
+    (assoc opts :green/exit 0)
+    (let [pw (read-remote-password opts)
+          ip (:ip opts)
+          public (run-quiet (closed-port-args ip (:valkey-port opts)) {} 15000)]
+      (cond
+        (not (seq pw))
+        (assoc opts :green/exit 1
+               :green/err "acceptance: could not read the generated Valkey password over ssh")
+
+        (= 0 (:exit public))
+        (assoc opts :green/exit 1
+               :green/err (str "acceptance: " ip ":" (:valkey-port opts)
+                               " accepted a connection from the internet; the port must not be public"))
+
+        (not= 10 (:exit public))
+        (assoc opts :green/exit 1
+               :green/err (str "acceptance: public-port probe failed with exit " (:exit public)
+                               "; closure is unverified"))
+
+        :else
+        (loop [ports (take 3 (repeatedly #(+ 20000 (rand-int 40000))))]
+          (if-let [port (first ports)]
+            (let [tunnel (run-quiet (tunnel-args opts port) {} 30000)]
+              (if-not (zero? (:exit tunnel))
+                (recur (rest ports))
+                (let [stamp (str "operator-" (System/currentTimeMillis))
+                      set-r (run-quiet (valkey-args port true "SET" "colors:operator" stamp)
+                                       {"VALKEYCLI_AUTH" pw} 30000)
+                      get-r (run-quiet (valkey-args port true "GET" "colors:operator")
+                                       {"VALKEYCLI_AUTH" pw} 30000)
+                      anon (run-quiet (valkey-args port false "PING") {} 30000)
+                      wrong (run-quiet (valkey-args port true "PING")
+                                       {"VALKEYCLI_AUTH" "not-the-password"} 30000)]
+                  (cond
+                    (not= "OK" (reply set-r))
+                    (assoc opts :green/exit 1
+                           :green/err (str "acceptance: SET through the tunnel answered '"
+                                           (reply set-r) "', expected OK"))
+
+                    (not= stamp (reply get-r))
+                    (assoc opts :green/exit 1
+                           :green/err (str "acceptance: GET through the tunnel answered '"
+                                           (reply get-r) "', expected " stamp))
+
+                    (not (str/includes? (reply anon) "NOAUTH"))
+                    (assoc opts :green/exit 1
+                           :green/err (str "acceptance: an unauthenticated PING answered '"
+                                           (reply anon) "' instead of NOAUTH"))
+
+                    (or (str/includes? (reply wrong) "PONG")
+                        (not (re-find #"WRONGPASS|NOAUTH" (reply wrong))))
+                    (assoc opts :green/exit 1
+                           :green/err (str "acceptance: a wrong password answered '"
+                                           (reply wrong) "' instead of a refusal"))
+
+                    :else
+                    (assoc opts :green/exit 0
+                           :valkey/acceptance {:tunnel "ok" :round-trip stamp
+                                              :unauthenticated "refused"
+                                              :wrong-password "refused"
+                                              :public-port "closed"})))))
+            (assoc opts :green/exit 1
+                   :green/err "acceptance: no local port could carry the ssh tunnel after three attempts")))))))
+
+;; --------------------------------------------------------------- describe
+
+(def monitor-file "/var/lib/colors/valkey-monitor.json")
+
+(defn describe-step
+  "Read the host's last monitor result over SSH and print it. Exits non-zero
+  when the host is unreachable or reports unhealthy; this is what an external
+  poller runs."
+  [opts]
+  (let [alias (ssh-config/host-alias opts)
+        r (run-quiet ["ssh" "-o" "BatchMode=yes" alias "cat" monitor-file] {} 20000)
+        parsed (try (json/parse-string (str/trim (str (:out r))) true) (catch Exception _ nil))
+        reachable (zero? (:exit r))
+        healthy (boolean (:healthy parsed))
+        problems (or (:problems parsed) (when-not reachable ["unreachable or no monitor result yet"]))]
+    (println (format "%-32s %-10s %s" alias
+                     (cond (not reachable) "UNKNOWN" healthy "ok" :else "UNHEALTHY")
+                     (str (or (:checked parsed) "")
+                          (when (seq problems) (str " " (str/join "; " problems))))))
+    (assoc opts :green/exit (if (and reachable healthy) 0 1)
+           :valkey/describe {:host alias :reachable reachable :healthy healthy
+                            :checked (:checked parsed) :problems problems})))

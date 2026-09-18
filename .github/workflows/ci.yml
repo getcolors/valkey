@@ -1,0 +1,15 @@
+name: Checks
+on: [push, pull_request]
+jobs:
+  green:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          bb: '1.12.218'
+      - uses: astral-sh/setup-uv@v6
+      - run: cd green && bb test && bb golden
+      - run: ./scripts/launcher.sh
+      - run: uv run --with ansible-core==2.21.1 python scripts/ssh-config-probe.py
+      - run: uv run --with ansible-core==2.21.1 bash scripts/syntax.sh

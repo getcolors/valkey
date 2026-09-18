@@ -1,0 +1,21 @@
+# Non-secret example. Supply your own existing buckets, endpoint, and SSH source.
+profile: valkey-example
+workdir: .colors
+provider-compute: vultr
+provider-backend: r2
+compute-prevent-destroy: true
+valkey-image: docker.io/valkey/valkey:9.1.2@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d
+valkey-version: 9.1.2
+valkey-port: 6379
+vultr-region: ams
+vultr-plan: vc2-1c-2gb
+vultr-os-id: 2284
+vultr-ssh-sources: ["192.0.2.1/32"]
+r2-bucket: example-state
+r2-endpoint: https://example.r2.cloudflarestorage.com
+valkey-backup-r2-bucket: example-backup
+valkey-backup-r2-endpoint: https://example.r2.cloudflarestorage.com
+valkey-backup-r2-region: auto
+valkey-backup-oncalendar: "*-*-* 00/6:00:00"
+valkey-backup-retention-days: 7
+valkey-backup-max-age-hours: 8

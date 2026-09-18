@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+launcher="$root/skills/package-valkey-green/green"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+checks=0
+fail(){ echo "launcher: FAIL — $*" >&2; exit 1; }
+ok(){ checks=$((checks+1)); echo "  ok — $*"; }
+
+[ -f "$launcher" ] || fail 'payload launcher is missing'
+grep -q 'io.github.getcolors.valkey.workflow/workflow' "$launcher" || fail 'workflow dispatch is missing'
+grep -q '(lib-coord "VALKEY_LIB_ROOT" valkey-git-url valkey-sha "green")' "$launcher" || fail 'the valkey coordinate must carry :deps/root green'
+for bad in 'defn.*-step' 'tofu/' 'ansible/'; do
+  ! grep -qE "$bad" "$launcher" || fail "launcher contains package logic: $bad"
+done
+ok 'dispatches to the library and contains no lifecycle logic'
+
+grep -qE '\(def \^:private valkey-sha (nil|"[0-9a-f]{40}")\)' "$launcher" || fail 'invalid pin site'
+[[ $(grep -c 'def \^:private valkey-sha' "$launcher") == 1 ]] || fail 'more than one pin site'
+ok 'has one managed immutable pin site'
+
+mkdir "$tmp/bare"
+cp "$launcher" "$tmp/bare/green"; chmod +x "$tmp/bare/green"
+if grep -q '(def \^:private valkey-sha nil)' "$launcher"; then
+  out=$(cd "$tmp/bare" && ./green build 2>&1 || true)
+  grep -q VALKEY_LIB_ROOT <<<"$out" || fail 'an unpinned launcher did not explain VALKEY_LIB_ROOT'
+  ok 'unstamped payload fails with an actionable working-tree override'
+else
+  ok 'payload carries a real package commit pin'
+fi
+
+mkdir "$tmp/project"
+cp "$launcher" "$tmp/project/green"; chmod +x "$tmp/project/green"
+sed "s#WORKDIR#.colors#" "$root/test/fixtures/colors.yml" > "$tmp/project/colors.yml"
+(cd "$tmp/project" && VALKEY_LIB_ROOT="$root" ./green build >/dev/null) || fail 'VALKEY_LIB_ROOT build failed'
+[ -f "$tmp/project/.colors/valkey-fixture/valkey-infrastructure/nodes/0/node-none.tf.json" ] || fail 'copied payload rendered nothing'
+[ -f "$tmp/project/.colors/valkey-fixture/valkey-ansible/compose.yml" ] || fail 'no ansible stage'
+[ -f "$tmp/project/.colors/valkey-fixture/valkey-ansible-local/main.yml" ] || fail 'no ssh-config stage'
+ok 'working-tree override renders from a copied payload'
+mkdir -p "$tmp/project/deep/path"
+(cd "$tmp/project/deep/path" && VALKEY_LIB_ROOT="$root" ../../green build >/dev/null) || fail 'upward desired-state search failed'
+ok 'finds colors.yml by walking upward'
+
+out=$(cd "$tmp/project" && VALKEY_LIB_ROOT="$root" COLORS_PAR_PROFILE=wrong ./green build 2>&1 || true)
+grep -q COLORS_PAR_PROFILE <<<"$out" || fail 'COLORS_PAR_PROFILE was not refused'
+[[ ! -d "$tmp/project/.colors/wrong" ]] || fail 'a profile overlay rendered a stage'
+ok 'refuses the profile overlay'
+
+out=$(cd "$tmp/project" && VALKEY_LIB_ROOT="$root" ./green nonsense 2>&1 || true)
+grep -q Usage <<<"$out" || fail 'unknown command has no usage'
+for verb in build create delete rehearse describe; do
+  grep -q "\"$verb\"" "$launcher" || fail "missing command $verb"
+done
+ok 'lifecycle, rehearsal and describe commands are dispatchable'
+
+[ -L "$root/green/green" ] && [ "$(readlink "$root/green/green")" = ../skills/package-valkey-green/green ] || fail 'green/green is not the payload symlink'
+[ ! -e "$root/green" ] || [ -d "$root/green" ] || fail 'the repository root must carry no launcher of its own'
+ok 'green/green is the payload symlink and the root carries no launcher'
+
+echo "launcher: $checks checks passed"

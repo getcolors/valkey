@@ -1,0 +1,7 @@
+.*
+!.envrc
+!.gitignore
+!.github
+.colors/
+target/
+session-notes.md

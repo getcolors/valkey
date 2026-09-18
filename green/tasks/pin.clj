@@ -1,0 +1,25 @@
+(ns pin (:require [clojure.java.shell :as sh] [clojure.string :as str]))
+;; Stamp the green payload from a clean pushed commit. Every payload is born
+;; unpinned (no invented SHAs) and `bb pin` stamps or re-stamps it after a
+;; clean, pushed HEAD. Each site recognises exactly two forms, its unpinned
+;; birth shape and its pinned shape, and the run fails loudly when a payload
+;; matches neither. Modelled on neon/green/tasks/pin.clj: one site per colour.
+(defn git [& args] (let [{:keys [exit out]} (apply sh/sh "git" args)] (when (zero? exit) (str/trim out))))
+
+(defn stamp-green [s sha]
+  (when (re-find #"\(def \^:private valkey-sha (?:nil|\"[0-9a-f]{40}\")\)" s)
+    (str/replace-first s #"\(def \^:private valkey-sha (?:nil|\"[0-9a-f]{40}\")\)"
+                       (str "(def ^:private valkey-sha \"" sha "\")"))))
+
+(def sites [{:path "../skills/package-valkey-green/green" :stamp stamp-green}])
+
+(let [dirty (git "status" "--porcelain") sha (git "rev-parse" "HEAD") remotes (git "branch" "-r" "--contains" sha)]
+  (cond (seq dirty) (do (binding [*out* *err*] (println "valkey working tree is dirty; commit before pinning")) (System/exit 2))
+        (not (str/includes? (str remotes) "origin/")) (do (binding [*out* *err*] (println "valkey HEAD is not pushed")) (System/exit 2))
+        :else (let [errors (atom [])]
+                (doseq [{:keys [path stamp]} sites]
+                  (let [s (slurp path) n (stamp s sha)]
+                    (if n (spit path n) (swap! errors conj (str "could not locate a pin form in " path)))))
+                (if (seq @errors)
+                  (do (binding [*out* *err*] (println (str/join "\n" @errors))) (System/exit 2))
+                  (println "pinned" (count sites) "launcher(s) to" (subs sha 0 7))))))

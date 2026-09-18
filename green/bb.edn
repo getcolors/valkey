@@ -1,0 +1,28 @@
+{:paths ["test/clj" "test/resources"]
+ :deps {io.github.getcolors/valkey {:local/root "."}}
+ :tasks
+ {test {:doc "Run unit tests under Babashka"
+        :requires ([clojure.test :as t]
+                   [io.github.getcolors.valkey.validate-test]
+                   [io.github.getcolors.valkey.ssh-test]
+                   [io.github.getcolors.valkey.ssh-config-test]
+                   [io.github.getcolors.valkey.tools-test]
+                   [io.github.getcolors.valkey.workflow-test])
+        :task (let [{:keys [fail error]}
+                    (t/run-tests 'io.github.getcolors.valkey.validate-test
+                                 'io.github.getcolors.valkey.ssh-test
+                                 'io.github.getcolors.valkey.ssh-config-test
+                                 'io.github.getcolors.valkey.tools-test
+                                 'io.github.getcolors.valkey.workflow-test)]
+                (when (pos? (+ fail error)) (System/exit 1))
+                (shell "python3" "../scripts/test-retention.py"))}
+  retention {:doc "Exercise fail-closed R2 retention with mocked object operations"
+             :task (shell "python3" "../scripts/test-retention.py")}
+  golden {:doc "Render and diff committed golden output"
+          :task (shell "../scripts/golden.sh")}
+  golden:accept {:doc "Regenerate goldens after inspecting a fresh render"
+                 :task (shell "../scripts/golden.sh" "--accept")}
+  syntax {:doc "Offline ansible-playbook --syntax-check and bash -n on the rendered tree"
+          :task (shell "../scripts/syntax.sh")}
+  pin {:doc "Stamp the launcher after a clean pushed commit"
+       :task (load-file "tasks/pin.clj")}}}
