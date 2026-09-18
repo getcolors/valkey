@@ -4,6 +4,8 @@ A green Package Skill for one Valkey server on one machine. The deployment uses 
 
 The live-test target is Vultr with existing Cloudflare R2 buckets. Compute operations come from the pinned `colors-compute` library. Other providers have no live verification from this build. There are no red or blue implementations.
 
+Valkey 9.1.2 passed two live converges, workstation acceptance, and a scratch recovery rehearsal on Vultr on 2026-09-18. The [Valkey Context Skill](https://github.com/getcolors/skills/tree/main/valkey-single-node) records the observed traps and verification limits. Detailed [deployment evidence](https://github.com/getcolors/valkey-vultr/blob/main/verification.md) requires access to the private deployment repository.
+
 ## Install and use
 
 ```sh
